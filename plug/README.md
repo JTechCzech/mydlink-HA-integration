@@ -7,5 +7,8 @@ Integrate your D-Link smart plugs to Home Assistant
 <img src=".github/mdlnkinter.png" width="25%" height="25%">
 3. Log-in with your mydlink login
 <img src=".github/mdlnklogin.png" width="25%" height="25%">
-4. Enojy
+4. Enjoy  
+<br>
+<span style="font-weight: bold;">Loading GIF...</span>  
 <img src=".github/inwork.gif" width="25%" height="25%">
+

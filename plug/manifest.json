@@ -1,7 +1,7 @@
 {
   "domain": "mydlink",
   "name": "MyDlink Smart Plug",
-  "documentation": "https://github.com/JTechCzech/mydlink-HA-integration/plug",
+  "documentation": "https://github.com/JTechCzech/mydlink-HA-integration/",
   "dependencies": [],
   "codeowners": ["@jtechczech"],
   "requirements": ["websocket-client>=1.2.1", "httpx[http2]"],

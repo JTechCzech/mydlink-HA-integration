@@ -1,0 +1,54 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Login to MyDlink",
+        "description": "Enter your MyDlink account credentials",
+        "data": {
+          "username": "Email",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid login credentials",
+      "no_devices_found": "No compatible devices found in your account",
+      "unknown": "Unexpected error"
+    },
+    "abort": {
+      "already_configured": "This account is already configured"
+    }
+  },
+  "options": {
+    "step": {
+      "device_config": {
+        "title": "MyDlink Device Options",
+        "description": "Configure MyDlink device behavior",
+        "data": {}
+      }
+    }
+  },
+  "entity": {
+    "switch": {
+      "mydlink_switch": {
+        "state_attributes": {
+          "device_id": {
+            "name": "Device ID"
+          },
+          "device_name": {
+            "name": "Device Name"
+          },
+          "device_model": {
+            "name": "Device Model"
+          },
+          "mac": {
+            "name": "MAC Address"
+          },
+          "mydlink_id": {
+            "name": "MyDlink ID"
+          }
+        }
+      }
+    }
+  }
+}

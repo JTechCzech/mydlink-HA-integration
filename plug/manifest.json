@@ -8,5 +8,5 @@
   "requirements": ["websocket-client>=1.2.1", "httpx[http2]"],
   "config_flow": true,
   "iot_class": "cloud_polling",
-  "version": "1.0.0b1+DSP1.0"
+  "version": "1.0.2"
 }

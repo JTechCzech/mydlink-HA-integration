@@ -339,7 +339,8 @@ class MyDlinkAPI:
                         'device_token': device_token,
                         'device_name': device.get('device_name', ''),
                         'mac': device.get('mac', ''),
-                        'device_model': device.get('device_model', '')
+                        'device_model': device.get('device_model', ''),
+                        'device_token_expiration': (datetime.now() + TOKEN_EXPIRATION).timestamp()
                     }
                     _LOGGER.debug(f"Zařízení {device.get('device_name')} ({mydlink_id}) má device_token: {device_token}")
             
@@ -419,21 +420,25 @@ class MyDlinkAPI:
                 
                 # Pokud máme device token z POST požadavku, použijeme ho
                 device_token = ''
+                device_token_expiration = None
                 if mydlink_id in device_tokens:
                     device_token = device_tokens[mydlink_id].get('device_token', '')
+                    device_token_expiration = device_tokens[mydlink_id].get('device_token_expiration')
                 
                 # Pokud device_token není k dispozici, použijeme fallback
                 if not device_token:
                     mac = device.get('mac', '')
                     device_token = f"{mac}-14e97fa5-3ce5-22b0-100d-5a971f4c226b"
+                    device_token_expiration = (datetime.now() + TOKEN_EXPIRATION).timestamp()
                     _LOGGER.warning(f"Device token nenalezen pro {device.get('device_name')}, používám fallback")
-                
+
                 device_info = {
                     'device_name': device.get('device_name', ''),
                     'device_model': device.get('device_model', ''),
                     'mac': device.get('mac', ''),
                     'mydlink_id': mydlink_id,
-                    'device_token': device_token
+                    'device_token': device_token,
+                    'device_token_expiration': device_token_expiration
                 }
                 self._device_data.append(device_info)
                 _LOGGER.info(LOG_DEVICE_FOUND.format(device_info['device_name']))
@@ -463,6 +468,45 @@ class MyDlinkAPI:
             if device["mydlink_id"] == mydlink_id:
                 return device
         return None
+
+    async def _check_and_refresh_tokens(self):
+        """Check if tokens are expired and refresh them if needed."""
+        # Zkontrolovat access_token
+        if not self._access_token or not self._token_expiration or datetime.now() >= self._token_expiration:
+            _LOGGER.info("Access token vypršel, obnovuji přihlášení...")
+            try:
+                await self.async_login()
+            except Exception as err:
+                _LOGGER.error(f"Chyba při obnově access tokenu: {err}")
+                return False
+
+        # Zkontrolovat device_tokens
+        need_refresh = False
+        for device in self._device_data:
+            expiration = device.get('device_token_expiration')
+            if expiration and datetime.now() >= datetime.fromtimestamp(expiration):
+                need_refresh = True
+                break
+
+        if need_refresh:
+            _LOGGER.info("Device tokeny vypršely, obnovuji...")
+            try:
+                mydlink_ids = [device.get('mydlink_id') for device in self._device_data if device.get('mydlink_id')]
+                if mydlink_ids:
+                    device_tokens = await self.async_get_device_tokens(mydlink_ids)
+                    # Aktualizovat device_data s novými tokeny
+                    for device in self._device_data:
+                        mydlink_id = device.get('mydlink_id')
+                        if mydlink_id in device_tokens:
+                            device['device_token'] = device_tokens[mydlink_id].get('device_token', device['device_token'])
+                            device['device_token_expiration'] = device_tokens[mydlink_id].get('device_token_expiration')
+                    # Uložit aktualizované tokeny
+                    await self.async_save_credentials()
+            except Exception as err:
+                _LOGGER.error(f"Chyba při obnově device tokenů: {err}")
+                return False
+
+        return True
 
     # WebSocket metody pro ovládání zařízení
     async def _on_ws_message(self, message):
@@ -586,14 +630,18 @@ class MyDlinkAPI:
         """Get device state using websocket."""
         if callback:
             self._ws_callback[device_id] = callback
-            
+
+        # Zkontrolovat a obnovit tokeny pokud vypršely
+        if not await self._check_and_refresh_tokens():
+            return False
+
         if not await self.async_ensure_ws_connected():
             return False
-            
+
         if not self._ws_client_id:
             _LOGGER.error("Chybí WS client_id")
             return False
-            
+
         # Najít zařízení podle ID
         device = self.get_device_by_mac(device_id)
         if not device:
@@ -628,13 +676,17 @@ class MyDlinkAPI:
 
     async def async_set_device_state(self, device_id, state):
         """Set device state using websocket."""
+        # Zkontrolovat a obnovit tokeny pokud vypršely
+        if not await self._check_and_refresh_tokens():
+            return False
+
         if not await self.async_ensure_ws_connected():
             return False
-            
+
         if not self._ws_client_id:
             _LOGGER.error("Chybí WS client_id")
             return False
-            
+
         # Najít zařízení podle ID
         device = self.get_device_by_mac(device_id)
         if not device:

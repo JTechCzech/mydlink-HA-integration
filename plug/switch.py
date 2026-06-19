@@ -1,6 +1,6 @@
 """Support for MyDlink Smart Plugs."""
 import logging
-from datetime import timedelta
+from datetime import timedelta, datetime
 
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
@@ -27,6 +27,8 @@ _LOGGER = logging.getLogger(__name__)
 
 # Aktualizace stavu každých 60 sekund
 SCAN_INTERVAL = timedelta(seconds=60)
+# Zařízení je nedostupné pokud nepřišla žádná odpověď déle než 5 minut
+AVAILABILITY_TIMEOUT = 300
 
 
 async def async_setup_entry(
@@ -48,9 +50,12 @@ async def async_setup_entry(
     
     # Vytvoříme koordinátor pro aktualizaci stavu
     async def async_update_data():
-        """Fetch data from API."""
-        # Nebudeme aktualizovat data přes koordinátor,
-        # místo toho budeme používat WebSocket pro aktualizace v reálném čase
+        """Pravidelně vyžádat stav všech zásuvek přes WebSocket."""
+        for plug in plugs:
+            try:
+                await api.async_get_device_state(plug["mac"])
+            except Exception as err:
+                _LOGGER.warning("Chyba při polling stavu %s: %s", plug.get("device_name"), err)
         return True
 
     coordinator = DataUpdateCoordinator(
@@ -81,13 +86,14 @@ class MyDlinkSwitch(CoordinatorEntity, SwitchEntity):
         super().__init__(coordinator)
         self._api = api
         self._state = None
+        self._last_seen = None
         self._device_info = device_info
         self._mac = device_info["mac"]
         self._device_id = device_info["mac"]
         self._attr_unique_id = f"{DOMAIN}_{self._mac}"
         self._attr_name = device_info["device_name"]
         self._attr_device_class = "outlet"
-        
+
         # Registrujeme callback pro aktualizaci stavu ze WebSocket
         self._register_callback()
 
@@ -109,7 +115,9 @@ class MyDlinkSwitch(CoordinatorEntity, SwitchEntity):
     @property
     def available(self) -> bool:
         """Return if switch is available."""
-        return self._state is not None
+        if self._state is None or self._last_seen is None:
+            return False
+        return (datetime.now() - self._last_seen).total_seconds() < AVAILABILITY_TIMEOUT
 
     @property
     def extra_state_attributes(self):
@@ -138,6 +146,7 @@ class MyDlinkSwitch(CoordinatorEntity, SwitchEntity):
     def _handle_state_update(self, state):
         """Handle state update from WebSocket."""
         self._state = state
+        self._last_seen = datetime.now()
         self.async_write_ha_state()
 
     async def async_added_to_hass(self) -> None:

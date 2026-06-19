@@ -52,16 +52,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     api = MyDlinkAPI(hass, email, password)
     
     # Načtení uložených přihlašovacích údajů
-    if not await api.async_load_stored_credentials():
-        try:
-            # Pokud nemáme platné přihlašovací údaje, přihlásíme se
+    try:
+        if await api.async_load_stored_credentials():
+            # Access token je platný, ale device tokeny mohly mezitím expirovat na serveru
+            # Proto je vždy obnovíme při startu
+            await api.async_refresh_device_tokens()
+        else:
             await api.async_login()
-        except DlinkAuthError as err:
-            _LOGGER.error("Authentication failed: %s", str(err))
-            raise ConfigEntryAuthFailed(f"Přihlášení selhalo: {err}") from err
-        except Exception as err:
-            _LOGGER.error("Error during setup: %s", str(err))
-            raise ConfigEntryNotReady(f"Chyba při inicializaci: {err}") from err
+    except DlinkAuthError as err:
+        _LOGGER.error("Authentication failed: %s", str(err))
+        raise ConfigEntryAuthFailed(f"Přihlášení selhalo: {err}") from err
+    except Exception as err:
+        _LOGGER.error("Error during setup: %s", str(err))
+        raise ConfigEntryNotReady(f"Chyba při inicializaci: {err}") from err
 
     # Uložení API klienta do hass.data
     hass.data[DOMAIN][entry.entry_id] = {
@@ -81,7 +84,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unload_ok:
         # Ukončení API klienta
         api = hass.data[DOMAIN][entry.entry_id][DATA_API_CLIENT]
-        api.shutdown()
+        await api.async_shutdown()
         
         # Odstranění dat
         hass.data[DOMAIN].pop(entry.entry_id)

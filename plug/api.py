@@ -36,6 +36,8 @@ _LOGGER = logging.getLogger(__name__)
 
 MIN_TIME_BETWEEN_UPDATES = timedelta(seconds=30)
 TOKEN_EXPIRATION = timedelta(days=2)  # Konzervativně předpokládáme 2 dny místo 3
+FALLBACK_TOKEN_EXPIRATION = timedelta(minutes=15)  # Fallback token se zkusí obnovit za 15 minut
+FALLBACK_TOKEN_SUFFIX = "-14e97fa5-3ce5-22b0-100d-5a971f4c226b"
 STORAGE_VERSION = 1
 STORAGE_KEY = "mydlink_credentials"
 
@@ -184,6 +186,12 @@ class MyDlinkAPI:
         }
         await self._store.async_save(data_to_save)
 
+    def _is_fallback_token(self, token):
+        """Return True if token is a MAC-based fallback or empty."""
+        if not token:
+            return True
+        return token.endswith(FALLBACK_TOKEN_SUFFIX)
+
     def _md5_hashing(self, data):
         """Create MD5 hash from data."""
         return hashlib.md5(data.encode('utf-8')).hexdigest()
@@ -329,18 +337,20 @@ class MyDlinkAPI:
                 device_token = device.get('device_token', '')
                 
                 # Pokud device_token není v odpovědi, použijeme MAC adresu a pevnou hodnotu jako fallback
-                if not device_token:
+                is_fallback = not device_token
+                if is_fallback:
                     mac = device.get('mac', '')
-                    device_token = f"{mac}-14e97fa5-3ce5-22b0-100d-5a971f4c226b"
-                    _LOGGER.warning(f"Device token nenalezen pro {device.get('device_name')}, používám fallback")
-                
+                    device_token = f"{mac}{FALLBACK_TOKEN_SUFFIX}"
+                    _LOGGER.warning(f"Device token nenalezen pro {device.get('device_name')}, používám fallback (zkusím znovu za 15 min)")
+
+                expiration = (datetime.now() + (FALLBACK_TOKEN_EXPIRATION if is_fallback else TOKEN_EXPIRATION)).timestamp()
                 if mydlink_id:
                     device_tokens[mydlink_id] = {
                         'device_token': device_token,
                         'device_name': device.get('device_name', ''),
                         'mac': device.get('mac', ''),
                         'device_model': device.get('device_model', ''),
-                        'device_token_expiration': (datetime.now() + TOKEN_EXPIRATION).timestamp()
+                        'device_token_expiration': expiration
                     }
                     _LOGGER.debug(f"Zařízení {device.get('device_name')} ({mydlink_id}) má device_token: {device_token}")
             
@@ -425,12 +435,12 @@ class MyDlinkAPI:
                     device_token = device_tokens[mydlink_id].get('device_token', '')
                     device_token_expiration = device_tokens[mydlink_id].get('device_token_expiration')
                 
-                # Pokud device_token není k dispozici, použijeme fallback
+                # Pokud device_token není k dispozici, použijeme fallback s krátkou expirací
                 if not device_token:
                     mac = device.get('mac', '')
-                    device_token = f"{mac}-14e97fa5-3ce5-22b0-100d-5a971f4c226b"
-                    device_token_expiration = (datetime.now() + TOKEN_EXPIRATION).timestamp()
-                    _LOGGER.warning(f"Device token nenalezen pro {device.get('device_name')}, používám fallback")
+                    device_token = f"{mac}{FALLBACK_TOKEN_SUFFIX}"
+                    device_token_expiration = (datetime.now() + FALLBACK_TOKEN_EXPIRATION).timestamp()
+                    _LOGGER.warning(f"Device token nenalezen pro {device.get('device_name')}, používám fallback (zkusím znovu za 15 min)")
 
                 device_info = {
                     'device_name': device.get('device_name', ''),
@@ -448,6 +458,39 @@ class MyDlinkAPI:
                 
         except Exception as err:
             _LOGGER.error(LOG_API_ERROR.format(str(err)))
+            return False
+
+    async def async_refresh_device_tokens(self):
+        """Refresh device tokens from API. Called on startup and after token errors."""
+        if not self._access_token or not self._device_data:
+            _LOGGER.debug("Nelze obnovit device tokeny - chybí access token nebo zařízení")
+            return False
+
+        mydlink_ids = [d.get('mydlink_id') for d in self._device_data if d.get('mydlink_id')]
+        if not mydlink_ids:
+            return False
+
+        _LOGGER.info("Obnovuji device tokeny ze serveru...")
+        try:
+            device_tokens = await self.async_get_device_tokens(mydlink_ids)
+            if not device_tokens:
+                _LOGGER.warning("Server nevrátil žádné device tokeny")
+                return False
+
+            for device in self._device_data:
+                mydlink_id = device.get('mydlink_id')
+                if mydlink_id in device_tokens:
+                    new_token = device_tokens[mydlink_id].get('device_token', '')
+                    old_token = device.get('device_token', '')
+                    if new_token and new_token != old_token:
+                        _LOGGER.info("Device token obnoven pro %s", device.get('device_name'))
+                    device['device_token'] = new_token
+                    device['device_token_expiration'] = device_tokens[mydlink_id].get('device_token_expiration')
+
+            await self.async_save_credentials()
+            return True
+        except Exception as err:
+            _LOGGER.error("Chyba při obnově device tokenů: %s", err)
             return False
 
     @property
@@ -470,37 +513,43 @@ class MyDlinkAPI:
         return None
 
     async def _check_and_refresh_tokens(self):
-        """Check if tokens are expired and refresh them if needed."""
+        """Check if tokens are expired or invalid and refresh them if needed."""
         # Zkontrolovat access_token
         if not self._access_token or not self._token_expiration or datetime.now() >= self._token_expiration:
-            _LOGGER.info("Access token vypršel, obnovuji přihlášení...")
+            _LOGGER.info("Access token vypršel nebo chybí, obnovuji přihlášení...")
             try:
                 await self.async_login()
             except Exception as err:
                 _LOGGER.error(f"Chyba při obnově access tokenu: {err}")
                 return False
 
-        # Zkontrolovat device_tokens
+        # Zkontrolovat device_tokens - vypršené, prázdné nebo fallback
         need_refresh = False
         for device in self._device_data:
+            token = device.get('device_token', '')
             expiration = device.get('device_token_expiration')
-            if expiration and datetime.now() >= datetime.fromtimestamp(expiration):
+
+            if self._is_fallback_token(token):
                 need_refresh = True
+                _LOGGER.debug(f"Fallback token pro {device.get('device_name')}, pokusím se obnovit")
+                break
+            if not expiration or datetime.now() >= datetime.fromtimestamp(expiration):
+                need_refresh = True
+                _LOGGER.debug(f"Token pro {device.get('device_name')} vypršel, obnovuji")
                 break
 
         if need_refresh:
-            _LOGGER.info("Device tokeny vypršely, obnovuji...")
+            _LOGGER.info("Obnovuji device tokeny...")
             try:
                 mydlink_ids = [device.get('mydlink_id') for device in self._device_data if device.get('mydlink_id')]
                 if mydlink_ids:
                     device_tokens = await self.async_get_device_tokens(mydlink_ids)
-                    # Aktualizovat device_data s novými tokeny
                     for device in self._device_data:
                         mydlink_id = device.get('mydlink_id')
                         if mydlink_id in device_tokens:
-                            device['device_token'] = device_tokens[mydlink_id].get('device_token', device['device_token'])
+                            new_token = device_tokens[mydlink_id].get('device_token', '')
+                            device['device_token'] = new_token
                             device['device_token_expiration'] = device_tokens[mydlink_id].get('device_token_expiration')
-                    # Uložit aktualizované tokeny
                     await self.async_save_credentials()
             except Exception as err:
                 _LOGGER.error(f"Chyba při obnově device tokenů: {err}")
@@ -515,22 +564,37 @@ class MyDlinkAPI:
             msg = json.loads(message)
             _LOGGER.debug("WS zpráva: %s", msg)
             
-            # Po přihlášení získáme client_id
+            # Po přihlášení získáme client_id a vyžádáme stav všech zařízení
             if msg.get('command') == 'sign_in' and msg.get('code') == 0 and msg.get('client_id'):
                 self._ws_client_id = msg['client_id']
                 _LOGGER.info("WS přihlášení OK, client_id: %s", self._ws_client_id)
-            
+                # Po (re)připojení vyžádat stav všech registrovaných zařízení
+                async def _refresh_all_states():
+                    for device_id in list(self._ws_callback):
+                        await self.async_get_device_state(device_id)
+                self.hass.async_create_task(_refresh_all_states())
+
             # Odpověď na get_setting - obsahuje stav zařízení
-            if msg.get('command') == 'get_setting' and isinstance(msg.get('setting'), list):
-                device_id = msg.get('device_id')
-                if device_id and device_id in self._ws_callback:
-                    type16 = next((s for s in msg['setting'] if s.get('type') == TYPE_SWITCH), None)
-                    if type16 and isinstance(type16.get('metadata', {}).get('value'), int):
-                        state = type16['metadata']['value'] == 1
-                        callback = self._ws_callback[device_id]
-                        # Zavolat callback asynchronně
-                        self.hass.async_create_task(self._execute_callback(callback, state))
-            
+            if msg.get('command') == 'get_setting':
+                code = msg.get('code', 0)
+                if code != 0:
+                    # Server odmítl příkaz - pravděpodobně neplatný device_token
+                    _LOGGER.warning("WS get_setting chyba kód %s: %s, obnovuji device tokeny...", code, msg.get('message', ''))
+                    self.hass.async_create_task(self.async_refresh_device_tokens())
+                elif isinstance(msg.get('setting'), list):
+                    device_id = msg.get('device_id')
+                    if device_id and device_id in self._ws_callback:
+                        type16 = next((s for s in msg['setting'] if s.get('type') == TYPE_SWITCH), None)
+                        if type16 and isinstance(type16.get('metadata', {}).get('value'), int):
+                            state = type16['metadata']['value'] == 1
+                            callback = self._ws_callback[device_id]
+                            self.hass.async_create_task(self._execute_callback(callback, state))
+
+            # Odpověď na set_setting - chyba znamená neplatný device_token
+            if msg.get('command') == 'set_setting' and msg.get('code', 0) != 0:
+                _LOGGER.warning("WS set_setting chyba kód %s: %s, obnovuji device tokeny...", msg.get('code'), msg.get('message', ''))
+                self.hass.async_create_task(self.async_refresh_device_tokens())
+
             # Změna stavu zásuvky (event)
             if msg.get('command') == 'event' and msg.get('event', {}).get('metadata', {}).get('type') == TYPE_SWITCH:
                 device_id = msg.get('device_id')
@@ -538,13 +602,22 @@ class MyDlinkAPI:
                     value = msg['event']['metadata']['value']
                     state = value == 1
                     callback = self._ws_callback[device_id]
-                    # Zavolat callback asynchronně
                     self.hass.async_create_task(self._execute_callback(callback, state))
-            
-            # Neplatný owner_id - potřebujeme obnovit token
-            if msg.get('command') == 'sign_in' and msg.get('code') == 82 and msg.get('message') == 'incorrect owner-id':
-                _LOGGER.warning("Neplatný owner-id, je potřeba obnovit token")
-                self.hass.async_create_task(self.async_login())
+
+            # Neplatný owner_id - vynutit nové přihlášení
+            if msg.get('command') == 'sign_in' and msg.get('code') == 82:
+                _LOGGER.warning("WS: neplatný owner-id (kód 82), vynucuji nové přihlášení...")
+                async def _relogin():
+                    try:
+                        self._access_token = None
+                        self._token_expiration = None
+                        await self._check_and_refresh_tokens()
+                        if self._ws:
+                            await self._ws.close()
+                            self._ws = None
+                    except Exception as err:
+                        _LOGGER.error("Chyba při obnově po WS chybě 82: %s", err)
+                self.hass.async_create_task(_relogin())
 
         except Exception as err:
             _LOGGER.error("Chyba při zpracování WS zprávy: %s", str(err))
